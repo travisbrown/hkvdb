@@ -1,0 +1,21 @@
+[package]
+name = "hkvdb"
+version = "0.1.0"
+authors = ["Travis Brown <travisrobertbrown@gmail.com>"]
+description = "A simple key-value store tracking historical information"
+keywords = ["rocksdb"]
+categories = ["database-implementations"]
+homepage = "https://github.com/travisbrown/hkvdb"
+repository = "https://github.com/travisbrown/hkvdb"
+license-file = "LICENSE"
+readme = "README.md"
+edition = "2021"
+exclude = [ ".github/*", "codecov.yml" ]
+
+[dependencies]
+log = "0.4"
+rocksdb = "0.17"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
