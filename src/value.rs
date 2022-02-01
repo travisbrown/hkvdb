@@ -41,7 +41,7 @@ pub trait Value: Add<Output = Self> + Into<Vec<u8>> + Sized {
 /// Represents a time range.
 ///
 /// The values will generally be epoch seconds, but this isn't necessary.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Range32 {
     first: u32,
     last: u32,
@@ -126,7 +126,7 @@ impl Value for Range32 {
 /// Represents a set of time observations as a sorted, deduplicated sequence.
 ///
 /// The values will generally be epoch seconds, but this isn't necessary.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Set32 {
     values: Vec<u32>,
 }
@@ -218,7 +218,7 @@ impl Value for Set32 {
     }
 }
 /// Represents a set of unsigned integers.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Set64 {
     values: Vec<u64>,
 }
