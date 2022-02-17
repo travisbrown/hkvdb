@@ -250,9 +250,9 @@ impl<V: Value + 'static> Hkvdb<V> {
     fn merge_by_id(
         _key: &[u8],
         existing_value: Option<&[u8]>,
-        operands: &mut MergeOperands,
+        operands: &MergeOperands,
     ) -> Option<Vec<u8>> {
-        V::merge(existing_value, operands).unwrap_or_else(|(error, fallback_value)| {
+        V::merge(existing_value, operands.iter()).unwrap_or_else(|(error, fallback_value)| {
             // The RocksDb library doesn't let us fail in a merge, so we just log the
             // error and use the last value before the error. This should never happen.
             log::error!("Error during aggregation in merge: {:?}", error);
@@ -264,9 +264,9 @@ impl<V: Value + 'static> Hkvdb<V> {
     fn merge_index(
         _key: &[u8],
         existing_value: Option<&[u8]>,
-        operands: &mut MergeOperands,
+        operands: &MergeOperands,
     ) -> Option<Vec<u8>> {
-        Set64::merge(existing_value, operands).unwrap_or_else(|(error, fallback_value)| {
+        Set64::merge(existing_value, operands.iter()).unwrap_or_else(|(error, fallback_value)| {
             // The RocksDb library doesn't let us fail in a merge, so we just log the
             // error and use the last value before the error. This should never happen.
             log::error!("Error during aggregation in index merge: {:?}", error);
