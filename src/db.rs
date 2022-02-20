@@ -135,6 +135,34 @@ impl<V: Value + 'static> Hkvdb<V> {
         Ok(result)
     }
 
+    pub fn iter_raw(&self) -> impl Iterator<Item = Result<(u64, Vec<u8>, V), Error>> + '_ {
+        self.db
+            .iterator_cf(self.by_id_cf(), IteratorMode::Start)
+            .map(|(key, value_bytes)| {
+                let id = u64::from_be_bytes(
+                    key[0..8]
+                        .try_into()
+                        .map_err(|_| Error::InvalidKey(key.to_vec()))?,
+                );
+
+                let value = V::prepare(&value_bytes)?;
+
+                Ok((id, key[8..].to_vec(), value))
+            })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Result<(u64, String, V), Error>> + '_ {
+        self.iter_raw().map(|result| {
+            result.and_then(|(id, bytes, value)| {
+                Ok((
+                    id,
+                    String::from_utf8(bytes).map_err(|error| error.utf8_error())?,
+                    value,
+                ))
+            })
+        })
+    }
+
     pub fn put_raw<IV: Into<V>>(&self, id: u64, data: &[u8], value: IV) -> Result<(), Error> {
         let key = Self::make_key(id, data);
         self.db
@@ -369,6 +397,31 @@ mod tests {
         .collect();
 
         assert_eq!(db.get(1).unwrap(), expected);
+    }
+
+    #[test]
+    fn iter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db: Hkvdb<Range32> = Hkvdb::new(dir, false).unwrap();
+
+        db.put_batch(
+            observations()
+                .iter()
+                .map(|observation| (observation.id, &observation.value, observation.timestamp)),
+        )
+        .unwrap();
+
+        let expected: Vec<(u64, String, Range32)> = vec![
+            (1, "bar".to_string(), (1, 1).into()),
+            (1, "foo".to_string(), (23, 101).into()),
+            (1, "qux".to_string(), (0, 50).into()),
+            (2, "FOO".to_string(), (23, 23).into()),
+            (2, "abc".to_string(), (23, 23).into()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(db.iter().collect::<Result<Vec<_>, _>>().unwrap(), expected);
     }
 
     #[test]
