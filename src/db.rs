@@ -1,10 +1,11 @@
 use super::{
     error::Error,
+    table::{Mode, Table, Writeable},
     value::{Set64, Value},
 };
 use rocksdb::{
-    BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DataBlockIndexType, IteratorMode,
-    MergeOperands, Options, SliceTransform, WriteBatch, DB,
+    BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DBIterator, DataBlockIndexType,
+    IteratorMode, MergeOperands, Options, SliceTransform, WriteBatch, DB,
 };
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
@@ -18,13 +19,79 @@ pub enum CaseSensitivity {
 }
 
 #[derive(Clone)]
-pub struct Hkvdb<V> {
+pub struct Hkvdb<M, V> {
     db: Arc<DB>,
     options: Options,
+    _mode: PhantomData<M>,
     _merge: PhantomData<V>,
 }
 
-impl<V: Value + 'static> Hkvdb<V> {
+impl<M, V> Table for Hkvdb<M, V> {
+    type Counts = (u64, u64);
+
+    fn underlying(&self) -> &DB {
+        &self.db
+    }
+
+    fn get_counts(&self) -> Result<Self::Counts, Error> {
+        let mut ids = HashSet::new();
+        let mut value_count = 0;
+
+        let mut iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
+
+        for (key, _) in iter.by_ref() {
+            let id = u64::from_be_bytes(
+                key[0..8]
+                    .try_into()
+                    .map_err(|_| Error::InvalidKey(key.to_vec()))?,
+            );
+
+            ids.insert(id);
+            value_count += 1;
+        }
+
+        iter.status()?;
+
+        Ok((ids.len() as u64, value_count))
+    }
+}
+
+impl<M, V> Hkvdb<M, V> {
+    pub fn statistics(&self) -> Option<String> {
+        self.options.get_statistics()
+    }
+
+    fn by_id_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle("by_id").unwrap()
+    }
+
+    fn index_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle("index").unwrap()
+    }
+
+    pub fn search_raw(
+        &self,
+        data: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<Vec<u64>, Error> {
+        let key = make_index_key(data, case_sensitivity)?;
+
+        match self.db.get_pinned_cf(self.index_cf(), key)? {
+            Some(bytes) => Ok(Set64::try_from(bytes.as_ref())?.into_inner()),
+            None => Ok(vec![]),
+        }
+    }
+
+    pub fn search(&self, data: &str) -> Result<Vec<u64>, Error> {
+        self.search_raw(data.as_bytes(), CaseSensitivity::Sensitive)
+    }
+
+    pub fn search_ci(&self, data: &str) -> Result<Vec<u64>, Error> {
+        self.search_raw(data.to_lowercase().as_bytes(), CaseSensitivity::Insensitive)
+    }
+}
+
+impl<M: Mode + 'static, V: Value + 'static> Hkvdb<M, V> {
     pub fn new<P: AsRef<Path>>(path: P, enable_statistics: bool) -> Result<Self, Error> {
         let mut options = Options::default();
         options.create_missing_column_families(true);
@@ -58,55 +125,19 @@ impl<V: Value + 'static> Hkvdb<V> {
         Ok(Self {
             db: Arc::new(db),
             options,
+            _mode: PhantomData,
             _merge: PhantomData,
         })
     }
+}
 
-    pub fn statistics(&self) -> Option<String> {
-        self.options.get_statistics()
-    }
-
-    fn by_id_cf(&self) -> &ColumnFamily {
-        self.db.cf_handle("by_id").unwrap()
-    }
-
-    fn index_cf(&self) -> &ColumnFamily {
-        self.db.cf_handle("index").unwrap()
-    }
-
-    pub fn get_estimated_key_count(&self) -> Result<u64, Error> {
-        Ok(self
-            .db
-            .property_int_value("rocksdb.estimate-num-keys")?
-            .unwrap())
-    }
-
-    pub fn get_counts(&self) -> Result<(u64, u64), Error> {
-        let mut ids = HashSet::new();
-        let mut value_count = 0;
-
-        let iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
-
-        for (key, _) in iter {
-            let id = u64::from_be_bytes(
-                key[0..8]
-                    .try_into()
-                    .map_err(|_| Error::InvalidKey(key.to_vec()))?,
-            );
-
-            ids.insert(id);
-            value_count += 1;
-        }
-
-        Ok((ids.len() as u64, value_count))
-    }
-
+impl<M, V: Value> Hkvdb<M, V> {
     pub fn get_raw(&self, id: u64) -> Result<HashMap<Vec<u8>, V>, Error> {
-        let prefix = Self::make_prefix(id);
+        let prefix = make_prefix(id);
         let mut result = HashMap::new();
-        let iterator = self.db.prefix_iterator_cf(self.by_id_cf(), prefix);
+        let mut iter = self.db.prefix_iterator_cf(self.by_id_cf(), prefix);
 
-        for (key, value_bytes) in iterator {
+        for (key, value_bytes) in iter.by_ref() {
             let next_id = u64::from_be_bytes(
                 key[0..8]
                     .try_into()
@@ -120,6 +151,8 @@ impl<V: Value + 'static> Hkvdb<V> {
                 break;
             }
         }
+
+        iter.status()?;
 
         Ok(result)
     }
@@ -135,20 +168,11 @@ impl<V: Value + 'static> Hkvdb<V> {
         Ok(result)
     }
 
-    pub fn iter_raw(&self) -> impl Iterator<Item = Result<(u64, Vec<u8>, V), Error>> + '_ {
-        self.db
-            .iterator_cf(self.by_id_cf(), IteratorMode::Start)
-            .map(|(key, value_bytes)| {
-                let id = u64::from_be_bytes(
-                    key[0..8]
-                        .try_into()
-                        .map_err(|_| Error::InvalidKey(key.to_vec()))?,
-                );
-
-                let value = V::prepare(&value_bytes)?;
-
-                Ok((id, key[8..].to_vec(), value))
-            })
+    pub fn iter_raw(&self) -> RawIterator<V> {
+        RawIterator {
+            underlying: self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start),
+            _merge: PhantomData,
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Result<(u64, String, V), Error>> + '_ {
@@ -161,118 +185,6 @@ impl<V: Value + 'static> Hkvdb<V> {
                 ))
             })
         })
-    }
-
-    pub fn put_raw<IV: Into<V>>(&self, id: u64, data: &[u8], value: IV) -> Result<(), Error> {
-        let key = Self::make_key(id, data);
-        self.db
-            .merge_cf(self.by_id_cf(), key, value.into().into())?;
-        Ok(())
-    }
-
-    pub fn put_raw_batch<'a, IV: Into<V>, I: IntoIterator<Item = (u64, &'a [u8], IV)>>(
-        &'a self,
-        batch: I,
-    ) -> Result<(), Error> {
-        let cf = self.by_id_cf();
-        let mut wb = WriteBatch::default();
-
-        for (id, data, value) in batch {
-            let key = Self::make_key(id, data);
-            wb.merge_cf(cf, key, value.into().into());
-        }
-
-        Ok(self.db.write(wb)?)
-    }
-
-    pub fn put<IV: Into<V>>(&self, id: u64, data: &str, value: IV) -> Result<(), Error> {
-        self.put_raw(id, data.as_bytes(), value)
-    }
-
-    pub fn put_batch<S: AsRef<str>, IV: Into<V>, I: IntoIterator<Item = (u64, S, IV)>>(
-        &self,
-        batch: I,
-    ) -> Result<(), Error> {
-        let cf = self.by_id_cf();
-        let mut wb = WriteBatch::default();
-
-        for (id, data, value) in batch {
-            let key = Self::make_key(id, data.as_ref().as_bytes());
-            wb.merge_cf(cf, key, value.into().into());
-        }
-
-        Ok(self.db.write(wb)?)
-    }
-
-    fn make_prefix(id: u64) -> Vec<u8> {
-        let mut key = Vec::with_capacity(8);
-        key.extend_from_slice(&id.to_be_bytes());
-        key
-    }
-
-    fn make_key(id: u64, value: &[u8]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(value.len() + 8);
-        key.extend_from_slice(&id.to_be_bytes());
-        key.extend_from_slice(value);
-        key
-    }
-
-    pub fn search_raw(
-        &self,
-        data: &[u8],
-        case_sensitivity: CaseSensitivity,
-    ) -> Result<Vec<u64>, Error> {
-        let key = Self::make_index_key(data, case_sensitivity)?;
-
-        match self.db.get_pinned_cf(self.index_cf(), key)? {
-            Some(bytes) => Ok(Set64::try_from(bytes.as_ref())?.into_inner()),
-            None => Ok(vec![]),
-        }
-    }
-
-    pub fn search(&self, data: &str) -> Result<Vec<u64>, Error> {
-        self.search_raw(data.as_bytes(), CaseSensitivity::Sensitive)
-    }
-
-    pub fn search_ci(&self, data: &str) -> Result<Vec<u64>, Error> {
-        self.search_raw(data.to_lowercase().as_bytes(), CaseSensitivity::Insensitive)
-    }
-
-    pub fn make_index(&self, case_sensitivity: CaseSensitivity) -> Result<(), Error> {
-        let iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
-
-        for (id_data_key, _) in iter {
-            let id = u64::from_be_bytes(
-                id_data_key[0..8]
-                    .try_into()
-                    .map_err(|_| Error::InvalidKey(id_data_key.to_vec()))?,
-            );
-
-            let index_key = Self::make_index_key(&id_data_key[8..], case_sensitivity)?;
-            let id_bytes: Vec<u8> = Set64::singleton(id).into();
-
-            self.db.merge_cf(self.index_cf(), &index_key, &id_bytes)?;
-        }
-
-        Ok(())
-    }
-
-    pub fn make_index_key(
-        data: &[u8],
-        case_sensitivity: CaseSensitivity,
-    ) -> Result<Vec<u8>, Error> {
-        let mut key = Vec::with_capacity(data.len());
-
-        if case_sensitivity == CaseSensitivity::Insensitive {
-            let as_string = std::str::from_utf8(data)?;
-            let lowercase = as_string.to_lowercase();
-
-            key.extend(lowercase.as_bytes());
-        } else {
-            key.extend_from_slice(data);
-        }
-
-        Ok(key)
     }
 
     fn merge_by_id(
@@ -304,9 +216,139 @@ impl<V: Value + 'static> Hkvdb<V> {
     }
 }
 
+pub struct RawIterator<'a, V> {
+    underlying: DBIterator<'a>,
+    _merge: PhantomData<V>,
+}
+
+impl<'a, V: Value> RawIterator<'a, V> {
+    fn parse(key: &[u8], value_bytes: &[u8]) -> <Self as Iterator>::Item {
+        let id = u64::from_be_bytes(
+            key[0..8]
+                .try_into()
+                .map_err(|_| Error::InvalidKey(key.to_vec()))?,
+        );
+
+        let value = V::prepare(value_bytes)?;
+
+        Ok((id, key[8..].to_vec(), value))
+    }
+}
+
+impl<'a, V: Value> Iterator for RawIterator<'a, V> {
+    type Item = Result<(u64, Vec<u8>, V), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.underlying.next() {
+            Some((key, value_bytes)) => Some(Self::parse(&key, &value_bytes)),
+            None => match self.underlying.status() {
+                Ok(()) => None,
+                Err(error) => Some(Err(Error::from(error))),
+            },
+        }
+    }
+}
+
+impl<V> Hkvdb<Writeable, V> {
+    pub fn make_index(&self, case_sensitivity: CaseSensitivity) -> Result<(), Error> {
+        let mut iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
+
+        for (id_data_key, _) in iter.by_ref() {
+            let id = u64::from_be_bytes(
+                id_data_key[0..8]
+                    .try_into()
+                    .map_err(|_| Error::InvalidKey(id_data_key.to_vec()))?,
+            );
+
+            let index_key = make_index_key(&id_data_key[8..], case_sensitivity)?;
+            let id_bytes: Vec<u8> = Set64::singleton(id).into();
+
+            self.db.merge_cf(self.index_cf(), &index_key, &id_bytes)?;
+        }
+
+        iter.status()?;
+
+        Ok(())
+    }
+}
+
+impl<V: Value> Hkvdb<Writeable, V> {
+    pub fn put_raw<IV: Into<V>>(&self, id: u64, data: &[u8], value: IV) -> Result<(), Error> {
+        let key = make_key(id, data);
+        self.db
+            .merge_cf(self.by_id_cf(), key, value.into().into())?;
+        Ok(())
+    }
+
+    pub fn put_raw_batch<'a, IV: Into<V>, I: IntoIterator<Item = (u64, &'a [u8], IV)>>(
+        &'a self,
+        batch: I,
+    ) -> Result<(), Error> {
+        let cf = self.by_id_cf();
+        let mut wb = WriteBatch::default();
+
+        for (id, data, value) in batch {
+            let key = make_key(id, data);
+            wb.merge_cf(cf, key, value.into().into());
+        }
+
+        Ok(self.db.write(wb)?)
+    }
+
+    pub fn put<IV: Into<V>>(&self, id: u64, data: &str, value: IV) -> Result<(), Error> {
+        self.put_raw(id, data.as_bytes(), value)
+    }
+
+    pub fn put_batch<S: AsRef<str>, IV: Into<V>, I: IntoIterator<Item = (u64, S, IV)>>(
+        &self,
+        batch: I,
+    ) -> Result<(), Error> {
+        let cf = self.by_id_cf();
+        let mut wb = WriteBatch::default();
+
+        for (id, data, value) in batch {
+            let key = make_key(id, data.as_ref().as_bytes());
+            wb.merge_cf(cf, key, value.into().into());
+        }
+
+        Ok(self.db.write(wb)?)
+    }
+}
+
+fn make_prefix(id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8);
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+fn make_key(id: u64, value: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(value.len() + 8);
+    key.extend_from_slice(&id.to_be_bytes());
+    key.extend_from_slice(value);
+    key
+}
+
+pub fn make_index_key(data: &[u8], case_sensitivity: CaseSensitivity) -> Result<Vec<u8>, Error> {
+    let mut key = Vec::with_capacity(data.len());
+
+    if case_sensitivity == CaseSensitivity::Insensitive {
+        let as_string = std::str::from_utf8(data)?;
+        let lowercase = as_string.to_lowercase();
+
+        key.extend(lowercase.as_bytes());
+    } else {
+        key.extend_from_slice(data);
+    }
+
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::value::{Range32, Set32};
+    use super::super::{
+        table::Writeable,
+        value::{Range32, Set32},
+    };
     use super::*;
 
     struct Observation {
@@ -341,7 +383,7 @@ mod tests {
     #[test]
     fn get_counts() {
         let dir = tempfile::tempdir().unwrap();
-        let db: Hkvdb<Range32> = Hkvdb::new(dir, false).unwrap();
+        let db: Hkvdb<Writeable, Range32> = Hkvdb::new(dir, false).unwrap();
 
         for observation in observations() {
             db.put(observation.id, &observation.value, observation.timestamp)
@@ -354,7 +396,7 @@ mod tests {
     #[test]
     fn put_raw_batch() {
         let dir = tempfile::tempdir().unwrap();
-        let db: Hkvdb<Range32> = Hkvdb::new(dir, false).unwrap();
+        let db: Hkvdb<Writeable, Range32> = Hkvdb::new(dir, false).unwrap();
 
         db.put_raw_batch(observations().iter().map(|observation| {
             (
@@ -379,7 +421,7 @@ mod tests {
     #[test]
     fn put_batch() {
         let dir = tempfile::tempdir().unwrap();
-        let db: Hkvdb<Range32> = Hkvdb::new(dir, false).unwrap();
+        let db: Hkvdb<Writeable, Range32> = Hkvdb::new(dir, false).unwrap();
 
         db.put_batch(
             observations()
@@ -402,7 +444,7 @@ mod tests {
     #[test]
     fn iter() {
         let dir = tempfile::tempdir().unwrap();
-        let db: Hkvdb<Range32> = Hkvdb::new(dir, false).unwrap();
+        let db: Hkvdb<Writeable, Range32> = Hkvdb::new(dir, false).unwrap();
 
         db.put_batch(
             observations()
@@ -427,7 +469,7 @@ mod tests {
     #[test]
     fn timestamp_range() {
         let dir = tempfile::tempdir().unwrap();
-        let db: Hkvdb<Range32> = Hkvdb::new(dir, false).unwrap();
+        let db: Hkvdb<Writeable, Range32> = Hkvdb::new(dir, false).unwrap();
 
         for observation in observations() {
             db.put(observation.id, &observation.value, observation.timestamp)
@@ -448,7 +490,7 @@ mod tests {
     #[test]
     fn timestamp_set() {
         let dir = tempfile::tempdir().unwrap();
-        let db: Hkvdb<Set32> = Hkvdb::new(dir, false).unwrap();
+        let db: Hkvdb<Writeable, Set32> = Hkvdb::new(dir, false).unwrap();
 
         for observation in observations() {
             db.put(observation.id, &observation.value, observation.timestamp)
@@ -469,7 +511,7 @@ mod tests {
     #[test]
     fn search() {
         let dir = tempfile::tempdir().unwrap();
-        let db: Hkvdb<Set32> = Hkvdb::new(dir, false).unwrap();
+        let db: Hkvdb<Writeable, Set32> = Hkvdb::new(dir, false).unwrap();
 
         for observation in observations() {
             db.put(observation.id, &observation.value, observation.timestamp)
@@ -484,7 +526,7 @@ mod tests {
     #[test]
     fn search_ci() {
         let dir = tempfile::tempdir().unwrap();
-        let db: Hkvdb<Set32> = Hkvdb::new(dir, false).unwrap();
+        let db: Hkvdb<Writeable, Set32> = Hkvdb::new(dir, false).unwrap();
 
         for observation in observations() {
             db.put(observation.id, &observation.value, observation.timestamp)
@@ -528,7 +570,7 @@ mod tests {
         ];
 
         let dir = tempfile::tempdir().unwrap();
-        let db: Hkvdb<Range32> = Hkvdb::new(dir, false).unwrap();
+        let db: Hkvdb<Writeable, Range32> = Hkvdb::new(dir, false).unwrap();
 
         for snapshot in snapshots {
             db.put(
