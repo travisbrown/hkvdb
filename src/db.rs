@@ -68,6 +68,27 @@ impl<M, V> Hkvdb<M, V> {
     fn index_cf(&self) -> &ColumnFamily {
         self.db.cf_handle("index").unwrap()
     }
+
+    pub fn search_raw(
+        &self,
+        data: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<Vec<u64>, Error> {
+        let key = make_index_key(data, case_sensitivity)?;
+
+        match self.db.get_pinned_cf(self.index_cf(), key)? {
+            Some(bytes) => Ok(Set64::try_from(bytes.as_ref())?.into_inner()),
+            None => Ok(vec![]),
+        }
+    }
+
+    pub fn search(&self, data: &str) -> Result<Vec<u64>, Error> {
+        self.search_raw(data.as_bytes(), CaseSensitivity::Sensitive)
+    }
+
+    pub fn search_ci(&self, data: &str) -> Result<Vec<u64>, Error> {
+        self.search_raw(data.to_lowercase().as_bytes(), CaseSensitivity::Insensitive)
+    }
 }
 
 impl<M: Mode + 'static, V: Value + 'static> Hkvdb<M, V> {
@@ -110,7 +131,7 @@ impl<M: Mode + 'static, V: Value + 'static> Hkvdb<M, V> {
     }
 }
 
-impl<M, V: Value + 'static> Hkvdb<M, V> {
+impl<M, V: Value> Hkvdb<M, V> {
     pub fn get_raw(&self, id: u64) -> Result<HashMap<Vec<u8>, V>, Error> {
         let prefix = make_prefix(id);
         let mut result = HashMap::new();
@@ -164,27 +185,6 @@ impl<M, V: Value + 'static> Hkvdb<M, V> {
                 ))
             })
         })
-    }
-
-    pub fn search_raw(
-        &self,
-        data: &[u8],
-        case_sensitivity: CaseSensitivity,
-    ) -> Result<Vec<u64>, Error> {
-        let key = make_index_key(data, case_sensitivity)?;
-
-        match self.db.get_pinned_cf(self.index_cf(), key)? {
-            Some(bytes) => Ok(Set64::try_from(bytes.as_ref())?.into_inner()),
-            None => Ok(vec![]),
-        }
-    }
-
-    pub fn search(&self, data: &str) -> Result<Vec<u64>, Error> {
-        self.search_raw(data.as_bytes(), CaseSensitivity::Sensitive)
-    }
-
-    pub fn search_ci(&self, data: &str) -> Result<Vec<u64>, Error> {
-        self.search_raw(data.to_lowercase().as_bytes(), CaseSensitivity::Insensitive)
     }
 
     fn merge_by_id(
@@ -249,7 +249,30 @@ impl<'a, V: Value> Iterator for RawIterator<'a, V> {
     }
 }
 
-impl<V: Value + 'static> Hkvdb<Writeable, V> {
+impl<V> Hkvdb<Writeable, V> {
+    pub fn make_index(&self, case_sensitivity: CaseSensitivity) -> Result<(), Error> {
+        let mut iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
+
+        for (id_data_key, _) in iter.by_ref() {
+            let id = u64::from_be_bytes(
+                id_data_key[0..8]
+                    .try_into()
+                    .map_err(|_| Error::InvalidKey(id_data_key.to_vec()))?,
+            );
+
+            let index_key = make_index_key(&id_data_key[8..], case_sensitivity)?;
+            let id_bytes: Vec<u8> = Set64::singleton(id).into();
+
+            self.db.merge_cf(self.index_cf(), &index_key, &id_bytes)?;
+        }
+
+        iter.status()?;
+
+        Ok(())
+    }
+}
+
+impl<V: Value> Hkvdb<Writeable, V> {
     pub fn put_raw<IV: Into<V>>(&self, id: u64, data: &[u8], value: IV) -> Result<(), Error> {
         let key = make_key(id, data);
         self.db
@@ -289,27 +312,6 @@ impl<V: Value + 'static> Hkvdb<Writeable, V> {
         }
 
         Ok(self.db.write(wb)?)
-    }
-
-    pub fn make_index(&self, case_sensitivity: CaseSensitivity) -> Result<(), Error> {
-        let mut iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
-
-        for (id_data_key, _) in iter.by_ref() {
-            let id = u64::from_be_bytes(
-                id_data_key[0..8]
-                    .try_into()
-                    .map_err(|_| Error::InvalidKey(id_data_key.to_vec()))?,
-            );
-
-            let index_key = make_index_key(&id_data_key[8..], case_sensitivity)?;
-            let id_bytes: Vec<u8> = Set64::singleton(id).into();
-
-            self.db.merge_cf(self.index_cf(), &index_key, &id_bytes)?;
-        }
-
-        iter.status()?;
-
-        Ok(())
     }
 }
 
