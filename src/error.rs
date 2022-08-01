@@ -13,7 +13,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn invalid_value(value: &[u8]) -> Error {
-        Error::InvalidValue(value.to_vec())
+    pub fn invalid_value(value: &[u8]) -> Self {
+        Self::InvalidValue(value.to_vec())
     }
 }
