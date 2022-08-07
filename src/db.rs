@@ -37,9 +37,10 @@ impl<M, V> Table for Hkvdb<M, V> {
         let mut ids = HashSet::new();
         let mut value_count = 0;
 
-        let mut iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
+        let iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
 
-        for (key, _) in iter.by_ref() {
+        for result in iter {
+            let (key, _) = result?;
             let id = u64::from_be_bytes(
                 key[0..8]
                     .try_into()
@@ -49,8 +50,6 @@ impl<M, V> Table for Hkvdb<M, V> {
             ids.insert(id);
             value_count += 1;
         }
-
-        iter.status()?;
 
         Ok((ids.len() as u64, value_count))
     }
@@ -134,10 +133,11 @@ impl<M: Mode + 'static, V: Value + 'static> Hkvdb<M, V> {
 impl<M, V: Value> Hkvdb<M, V> {
     pub fn get_raw(&self, id: u64) -> Result<HashMap<Vec<u8>, V>, Error> {
         let prefix = make_prefix(id);
-        let mut result = HashMap::new();
-        let mut iter = self.db.prefix_iterator_cf(self.by_id_cf(), prefix);
+        let mut results = HashMap::new();
+        let iter = self.db.prefix_iterator_cf(self.by_id_cf(), prefix);
 
-        for (key, value_bytes) in iter.by_ref() {
+        for result in iter {
+            let (key, value_bytes) = result?;
             let next_id = u64::from_be_bytes(
                 key[0..8]
                     .try_into()
@@ -146,15 +146,13 @@ impl<M, V: Value> Hkvdb<M, V> {
 
             if next_id == id {
                 let value = V::prepare(&value_bytes)?;
-                result.insert(key[8..].to_vec(), value);
+                results.insert(key[8..].to_vec(), value);
             } else {
                 break;
             }
         }
 
-        iter.status()?;
-
-        Ok(result)
+        Ok(results)
     }
 
     pub fn get(&self, id: u64) -> Result<HashMap<String, V>, Error> {
@@ -239,21 +237,20 @@ impl<'a, V: Value> Iterator for RawIterator<'a, V> {
     type Item = Result<(u64, Vec<u8>, V), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.underlying.next() {
-            Some((key, value_bytes)) => Some(Self::parse(&key, &value_bytes)),
-            None => match self.underlying.status() {
-                Ok(()) => None,
-                Err(error) => Some(Err(Error::from(error))),
-            },
-        }
+        self.underlying.next().map(|result| {
+            result
+                .map_err(Error::from)
+                .and_then(|(key, value_bytes)| Self::parse(&key, &value_bytes))
+        })
     }
 }
 
 impl<V> Hkvdb<Writeable, V> {
     pub fn make_index(&self, case_sensitivity: CaseSensitivity) -> Result<(), Error> {
-        let mut iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
+        let iter = self.db.iterator_cf(self.by_id_cf(), IteratorMode::Start);
 
-        for (id_data_key, _) in iter.by_ref() {
+        for result in iter {
+            let (id_data_key, _) = result?;
             let id = u64::from_be_bytes(
                 id_data_key[0..8]
                     .try_into()
@@ -265,8 +262,6 @@ impl<V> Hkvdb<Writeable, V> {
 
             self.db.merge_cf(self.index_cf(), &index_key, &id_bytes)?;
         }
-
-        iter.status()?;
 
         Ok(())
     }
