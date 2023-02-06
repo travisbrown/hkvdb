@@ -1,6 +1,6 @@
 [package]
 name = "hkvdb"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["Travis Brown <travisrobertbrown@gmail.com>"]
 description = "A simple key-value store tracking historical information"
 keywords = ["rocksdb"]
